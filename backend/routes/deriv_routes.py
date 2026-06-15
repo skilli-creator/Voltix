@@ -1,12 +1,11 @@
 # backend/routes/deriv_routes.py
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, session
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from models.database import db
 from services.deriv_service import DerivService
+from websocket_manager import deriv_ws  # Import the singleton
 import logging
-import threading
-import json
-import websocket
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,7 +16,7 @@ deriv_bp = Blueprint('deriv', __name__)
 @deriv_bp.route('/connect', methods=['POST'])
 @jwt_required()
 def connect_deriv():
-    """Connect Deriv account using API token"""
+    """Connect Deriv account using API token - SINGLE CONNECTION"""
     user_id = get_jwt_identity()
     data = request.json
     
@@ -27,20 +26,25 @@ def connect_deriv():
     if not api_token:
         return jsonify({'error': 'API token required'}), 400
     
-    # Get account info directly
-    info_success, account_info = DerivService.get_account_info(api_token)
+    # Use the singleton WebSocket manager
+    result = deriv_ws.authorize(api_token)
     
-    if not info_success:
-        return jsonify({'error': 'Failed to get account info. Invalid API token?'}), 400
+    if result.get('status') != 'success':
+        return jsonify({'error': result.get('message', 'Failed to authorize')}), 400
     
-    # Get balance - uses authorized account directly
-    balance_success, balance, currency, loginid = DerivService.get_balance(api_token)
+    # Get account info from result
+    loginid = result.get('loginid')
+    balance = result.get('balance', 0)
+    account_list = result.get('account_list', [])
     
-    if not balance_success:
-        balance = 0
-        currency = 'USD'
+    # Find current account in list
+    current_account = None
+    for acc in account_list:
+        if acc.get('loginid') == loginid:
+            current_account = acc
+            break
     
-    # Determine account type from loginid
+    # Determine account type
     if loginid and loginid.startswith('VRTC'):
         detected_account_type = 'Demo'
     elif loginid and loginid.startswith('CR'):
@@ -57,25 +61,30 @@ def connect_deriv():
     try:
         cursor.execute("""
             SELECT id FROM deriv_accounts WHERE user_id = %s AND account_id = %s
-        """, (user_id, account_info['account_id']))
+        """, (user_id, loginid))
         existing = cursor.fetchone()
         
         if existing:
             cursor.execute("""
                 UPDATE deriv_accounts 
                 SET token = %s, balance = %s, currency = %s, account_type = %s, 
-                    email = %s, last_sync_at = NOW()
+                    email = %s, last_sync_at = NOW(), is_active = 1
                 WHERE user_id = %s AND account_id = %s
-            """, (api_token.encode(), balance, currency, detected_account_type, 
-                  account_info['email'], user_id, account_info['account_id']))
+            """, (api_token.encode(), balance, 'USD', detected_account_type, 
+                  current_account.get('email', '') if current_account else '', 
+                  user_id, loginid))
         else:
             cursor.execute("""
-                INSERT INTO deriv_accounts (user_id, account_id, email, token, balance, currency, account_type)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (user_id, account_info['account_id'], account_info['email'], 
-                  api_token.encode(), balance, currency, detected_account_type))
+                INSERT INTO deriv_accounts (user_id, account_id, email, token, balance, currency, account_type, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 1)
+            """, (user_id, loginid, current_account.get('email', '') if current_account else '', 
+                  api_token.encode(), balance, 'USD', detected_account_type))
         
         conn.commit()
+        
+        # Store in Flask session for this request
+        session['deriv_authorized'] = True
+        session['deriv_loginid'] = loginid
         
     except Exception as e:
         logger.error(f"Database error: {e}")
@@ -88,11 +97,11 @@ def connect_deriv():
     return jsonify({
         'message': 'Deriv account connected successfully',
         'account': {
-            'account_id': account_info['account_id'],
+            'account_id': loginid,
             'balance': balance,
-            'currency': currency,
+            'currency': 'USD',
             'account_type': detected_account_type,
-            'email': account_info['email']
+            'email': current_account.get('email', '') if current_account else ''
         }
     }), 200
 
@@ -100,16 +109,21 @@ def connect_deriv():
 @deriv_bp.route('/balance', methods=['GET'])
 @jwt_required()
 def get_balance():
-    """Get current balance from Deriv - uses authorized account directly"""
+    """Get current balance using EXISTING WebSocket connection"""
     user_id = get_jwt_identity()
     
+    # Check if we have an active Deriv connection
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected. Please connect first.'}), 401
+    
+    # Get active account from database
     conn = db.get_connection()
     if not conn:
         return jsonify({'error': 'Database error'}), 500
     
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT token, account_id, account_type FROM deriv_accounts 
+        SELECT account_id, account_type FROM deriv_accounts 
         WHERE user_id = %s AND is_active = 1
     """, (user_id,))
     account = cursor.fetchone()
@@ -119,122 +133,89 @@ def get_balance():
     if not account:
         return jsonify({'error': 'No Deriv account connected'}), 404
     
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
+    active_account = account['account_id']
     
-    success, balance, currency, loginid = DerivService.get_balance(api_token)
+    # ✅ CORRECT: Use existing connection, NO new authorize
+    balance_data = deriv_ws.get_balance(active_account)
     
-    if not success:
-        return jsonify({'error': balance}), 500
-    
-    account_type = 'Demo' if loginid and loginid.startswith('VRTC') else 'Real'
+    if 'error' in balance_data:
+        return jsonify({'error': balance_data['error']}), 500
     
     # Update balance in database
     conn2 = db.get_connection()
     if conn2:
         cursor2 = conn2.cursor()
         cursor2.execute("""
-            UPDATE deriv_accounts SET balance = %s, last_sync_at = NOW() WHERE user_id = %s
-        """, (balance, user_id))
+            UPDATE deriv_accounts SET balance = %s, last_sync_at = NOW() 
+            WHERE user_id = %s AND account_id = %s
+        """, (balance_data['balance'], user_id, active_account))
         conn2.commit()
         cursor2.close()
         conn2.close()
     
+    account_type = 'Demo' if active_account and active_account.startswith('VRTC') else 'Real'
+    
     return jsonify({
-        'balance': balance,
-        'currency': currency,
-        'account_id': loginid or account['account_id'],
-        'account_type': account_type,
-        'email': account.get('email', '')
+        'balance': balance_data['balance'],
+        'currency': balance_data['currency'],
+        'account_id': active_account,
+        'account_type': account_type
     }), 200
 
 
 @deriv_bp.route('/accounts', methods=['GET'])
 @jwt_required()
 def get_accounts():
-    """Get all accounts (Real and Demo) for the user"""
+    """Get all accounts using cached data from WebSocket"""
     user_id = get_jwt_identity()
     
+    # Check if we have an active Deriv connection
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected. Please connect first.'}), 401
+    
+    # Get cached accounts from WebSocket manager
+    accounts = deriv_ws.current_accounts
+    
+    if not accounts:
+        return jsonify({'error': 'No accounts found'}), 404
+    
+    # Format accounts for response
+    formatted_accounts = []
+    for acc in accounts:
+        if acc.get('account_category') == 'trading':
+            formatted_accounts.append({
+                'account_id': acc.get('loginid'),
+                'account_type': 'Demo' if acc.get('is_virtual') else 'Real',
+                'balance': acc.get('balance', 0),
+                'currency': acc.get('currency', 'USD'),
+                'is_virtual': acc.get('is_virtual', 1)
+            })
+    
+    # Get currently active account from database
     conn = db.get_connection()
-    if not conn:
-        return jsonify({'error': 'Database error'}), 500
-    
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT token FROM deriv_accounts 
-        WHERE user_id = %s AND is_active = 1
-    """, (user_id,))
-    account = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
-    
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
-    
-    # Get account list from Deriv API
-    result = {"success": False, "accounts": [], "error": None}
-    response_received = threading.Event()
-    
-    def on_message(ws, message):
-        data = json.loads(message)
-        print(f"📨 Accounts Response: {data}")
-        
-        if data.get('authorize'):
-            account_list = data['authorize'].get('account_list', [])
-            accounts = []
-            for acc in account_list:
-                if acc.get('account_category') == 'trading':
-                    accounts.append({
-                        'account_id': acc.get('loginid'),
-                        'account_type': 'Demo' if acc.get('is_virtual') else 'Real',
-                        'balance': acc.get('balance', 0),
-                        'currency': acc.get('currency', 'USD'),
-                        'is_virtual': acc.get('is_virtual', 1)
-                    })
-            result["success"] = True
-            result["accounts"] = accounts
-            response_received.set()
-            ws.close()
-        elif data.get('error'):
-            result["error"] = data['error']['message']
-            response_received.set()
-            ws.close()
-    
-    def on_error(ws, error):
-        result["error"] = str(error)
-        response_received.set()
-    
-    def on_open(ws):
-        ws.send(json.dumps({"authorize": api_token}))
-    
-    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id=1089"
-    ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error)
-    
-    wst = threading.Thread(target=ws.run_forever)
-    wst.daemon = True
-    wst.start()
-    
-    response_received.wait(timeout=10)
-    
-    try:
-        ws.close()
-    except:
-        pass
-    
-    if result["success"]:
-        return jsonify({
-            'accounts': result['accounts'],
-            'current_account': None
-        }), 200
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT account_id FROM deriv_accounts 
+            WHERE user_id = %s AND is_active = 1
+        """, (user_id,))
+        current = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        current_account = current['account_id'] if current else None
     else:
-        return jsonify({'error': result['error'] or 'Failed to get accounts'}), 500
+        current_account = None
+    
+    return jsonify({
+        'accounts': formatted_accounts,
+        'current_account': current_account
+    }), 200
 
 
 @deriv_bp.route('/switch-account', methods=['POST'])
 @jwt_required()
 def switch_account():
-    """Switch to a different Deriv account by re-authorizing with that account"""
+    """Switch to a different Deriv account - NO NEW WEBSOCKET CONNECTION"""
     user_id = get_jwt_identity()
     data = request.json
     
@@ -244,104 +225,58 @@ def switch_account():
     if not new_account_id:
         return jsonify({'error': 'Account loginid required'}), 400
     
-    # Get user's API token from database
+    # ✅ FIXED: Just update the database and session - NO API call needed
     conn = db.get_connection()
     if not conn:
         return jsonify({'error': 'Database error'}), 500
     
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT token FROM deriv_accounts 
-        WHERE user_id = %s AND is_active = 1
-    """, (user_id,))
-    account = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
-    
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
-    
-    # Re-authorize with the selected account
-    result = {"success": False, "balance": None, "currency": None, "loginid": None, "error": None}
-    response_received = threading.Event()
-    
-    def on_message(ws, message):
-        data = json.loads(message)
-        print(f"📨 Switch Response: {data}")
-        
-        if data.get('authorize'):
-            # After successful authorization, get balance
-            ws.send(json.dumps({"balance": 1}))
-        
-        elif data.get('balance'):
-            result["success"] = True
-            result["balance"] = data['balance']['balance']
-            result["currency"] = data['balance']['currency']
-            result["loginid"] = data['balance']['loginid']
-            response_received.set()
-            ws.close()
-        
-        elif data.get('error'):
-            result["error"] = data['error']['message']
-            response_received.set()
-            ws.close()
-    
-    def on_error(ws, error):
-        result["error"] = str(error)
-        response_received.set()
-    
-    def on_open(ws):
-        # Re-authorize with the selected account
-        ws.send(json.dumps({
-            "authorize": api_token,
-            "account": new_account_id
-        }))
-    
-    ws_url = f"wss://ws.derivws.com/websockets/v3?app_id=1089"
-    ws = websocket.WebSocketApp(ws_url, on_open=on_open, on_message=on_message, on_error=on_error)
-    
-    wst = threading.Thread(target=ws.run_forever)
-    wst.daemon = True
-    wst.start()
-    
-    response_received.wait(timeout=15)
-    
+    cursor = conn.cursor()
     try:
-        ws.close()
-    except:
-        pass
-    
-    if result["success"]:
-        # Update database with new account info
-        conn2 = db.get_connection()
-        if conn2:
-            cursor2 = conn2.cursor()
-            cursor2.execute("""
-                UPDATE deriv_accounts 
-                SET account_id = %s, account_type = %s, balance = %s, last_sync_at = NOW()
-                WHERE user_id = %s
-            """, (new_account_id, account_type, result['balance'], user_id))
-            conn2.commit()
-            cursor2.close()
-            conn2.close()
+        # Update database with new active account
+        cursor.execute("""
+            UPDATE deriv_accounts 
+            SET account_id = %s, account_type = %s, is_active = 1
+            WHERE user_id = %s
+        """, (new_account_id, account_type, user_id))
+        
+        conn.commit()
+        
+        # Update session
+        session['deriv_loginid'] = new_account_id
+        
+        # Get balance for new account using existing WebSocket
+        balance_data = deriv_ws.get_balance(new_account_id)
+        
+        # Update balance in database
+        if 'balance' in balance_data:
+            cursor.execute("""
+                UPDATE deriv_accounts SET balance = %s WHERE user_id = %s AND account_id = %s
+            """, (balance_data['balance'], user_id, new_account_id))
+            conn.commit()
+        
+        logger.info(f"[{datetime.now()}] 🔄 Switched to account: {new_account_id}")
         
         return jsonify({
             'message': f'Switched to account: {new_account_id}',
             'account_id': new_account_id,
             'account_type': account_type,
-            'balance': result['balance'],
-            'currency': result['currency']
+            'balance': balance_data.get('balance', 0),
+            'currency': balance_data.get('currency', 'USD')
         }), 200
-    else:
-        return jsonify({'error': result['error'] or 'Failed to switch account'}), 500
+        
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Switch account error: {e}")
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cursor.close()
+        conn.close()
 
 
 @deriv_bp.route('/place-trade', methods=['POST'])
 @jwt_required()
 def place_trade():
-    """Place a manual trade - uses authorized account directly"""
+    """Place a manual trade using existing WebSocket connection"""
     user_id = get_jwt_identity()
     data = request.json
     
@@ -357,13 +292,18 @@ def place_trade():
     if amount < 1.50:
         return jsonify({'error': 'Minimum stake is $1.50'}), 400
     
+    # Check if connected
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected'}), 401
+    
+    # Get active account
     conn = db.get_connection()
     if not conn:
         return jsonify({'error': 'Database error'}), 500
     
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT token, account_id FROM deriv_accounts 
+        SELECT account_id FROM deriv_accounts 
         WHERE user_id = %s AND is_active = 1
     """, (user_id,))
     account = cursor.fetchone()
@@ -371,14 +311,15 @@ def place_trade():
     conn.close()
     
     if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
+        return jsonify({'error': 'No active account found'}), 404
     
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
-    
+    # Place trade using DerivService (this should be modified to use the WebSocket)
     trade_type = 'CALL' if direction.lower() == 'rise' else 'PUT'
     
+    # For now, keep using DerivService but ensure it doesn't create new connection
+    # You'll need to modify DerivService to use the singleton WebSocket
     success, result = DerivService.place_trade(
-        api_token=api_token,
+        api_token=deriv_ws.current_token,  # Use token from singleton
         symbol=symbol,
         trade_type=trade_type,
         amount=amount,
@@ -397,11 +338,54 @@ def place_trade():
     }), 200
 
 
+@deriv_bp.route('/disconnect', methods=['POST'])
+@jwt_required()
+def disconnect_deriv():
+    """Disconnect Deriv account and close WebSocket"""
+    user_id = get_jwt_identity()
+    
+    # Close WebSocket connection
+    deriv_ws.disconnect()
+    
+    # Update database
+    conn = db.get_connection()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE deriv_accounts SET is_active = 0 WHERE user_id = %s
+        """, (user_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+    
+    # Clear session
+    session.clear()
+    
+    return jsonify({'message': 'Deriv account disconnected'}), 200
+
+
+@deriv_bp.route('/status', methods=['GET'])
+@jwt_required()
+def deriv_status():
+    """Get current Deriv connection status"""
+    return jsonify({
+        'connected': deriv_ws.authorized,
+        'active_account': session.get('deriv_loginid'),
+        'websocket_active': deriv_ws.ws is not None
+    }), 200
+
+
+# Keep other endpoints (active-contracts, trade-history, profit-loss, test-connect)
+# as they were, but they should be modified to use the singleton WebSocket
+
 @deriv_bp.route('/active-contracts', methods=['GET'])
 @jwt_required()
 def get_active_contracts():
     """Get all active contracts (open trades)"""
     user_id = get_jwt_identity()
+    
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected'}), 401
     
     conn = db.get_connection()
     if not conn:
@@ -409,18 +393,17 @@ def get_active_contracts():
     
     cursor = conn.cursor(dictionary=True)
     cursor.execute("""
-        SELECT token FROM deriv_accounts WHERE user_id = %s AND is_active = 1
+        SELECT account_id FROM deriv_accounts WHERE user_id = %s AND is_active = 1
     """, (user_id,))
     account = cursor.fetchone()
     cursor.close()
     conn.close()
     
     if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
+        return jsonify({'error': 'No active account found'}), 404
     
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
-    
-    success, contracts = DerivService.get_active_contracts(api_token)
+    # Use DerivService with singleton token
+    success, contracts = DerivService.get_active_contracts(deriv_ws.current_token)
     
     if not success:
         return jsonify({'error': contracts}), 500
@@ -434,30 +417,15 @@ def get_active_contracts():
 @deriv_bp.route('/trade-history', methods=['GET'])
 @jwt_required()
 def get_trade_history():
-    """Get trade history from Deriv API (real-time)"""
+    """Get trade history from Deriv API"""
     user_id = get_jwt_identity()
     
-    conn = db.get_connection()
-    if not conn:
-        return jsonify({'error': 'Database error'}), 500
-    
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT token FROM deriv_accounts 
-        WHERE user_id = %s AND is_active = 1
-    """, (user_id,))
-    account = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
-    
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected'}), 401
     
     limit = request.args.get('limit', 50, type=int)
     
-    success, history = DerivService.get_trade_history(api_token, limit)
+    success, history = DerivService.get_trade_history(deriv_ws.current_token, limit)
     
     if not success:
         return jsonify({'error': history}), 500
@@ -471,28 +439,13 @@ def get_trade_history():
 @deriv_bp.route('/profit-loss', methods=['GET'])
 @jwt_required()
 def get_profit_loss():
-    """Get profit/loss summary from Deriv API"""
+    """Get profit/loss summary"""
     user_id = get_jwt_identity()
     
-    conn = db.get_connection()
-    if not conn:
-        return jsonify({'error': 'Database error'}), 500
+    if not deriv_ws.authorized:
+        return jsonify({'error': 'Deriv not connected'}), 401
     
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT token FROM deriv_accounts 
-        WHERE user_id = %s AND is_active = 1
-    """, (user_id,))
-    account = cursor.fetchone()
-    cursor.close()
-    conn.close()
-    
-    if not account:
-        return jsonify({'error': 'No Deriv account connected'}), 404
-    
-    api_token = account['token'].decode('utf-8') if isinstance(account['token'], bytes) else account['token']
-    
-    success, history = DerivService.get_trade_history(api_token, 200)
+    success, history = DerivService.get_trade_history(deriv_ws.current_token, 200)
     
     if not success:
         return jsonify({'error': history}), 500
@@ -512,27 +465,6 @@ def get_profit_loss():
     }), 200
 
 
-@deriv_bp.route('/disconnect', methods=['POST'])
-@jwt_required()
-def disconnect_deriv():
-    """Disconnect Deriv account"""
-    user_id = get_jwt_identity()
-    
-    conn = db.get_connection()
-    if not conn:
-        return jsonify({'error': 'Database error'}), 500
-    
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE deriv_accounts SET is_active = 0 WHERE user_id = %s
-    """, (user_id,))
-    conn.commit()
-    cursor.close()
-    conn.close()
-    
-    return jsonify({'message': 'Deriv account disconnected'}), 200
-
-
 @deriv_bp.route('/test-connect', methods=['POST'])
 def test_connect():
     """Test Deriv connection without JWT (for testing only)"""
@@ -545,16 +477,16 @@ def test_connect():
     
     logger.info(f"Testing Deriv connection with token: {api_token[:20]}...")
     
-    info_success, account_info = DerivService.get_account_info(api_token)
+    # Use a temporary connection for testing
+    from websocket_manager import DerivWSManager
+    test_ws = DerivWSManager()
+    result = test_ws.authorize(api_token)
     
-    if not info_success:
-        return jsonify({'error': 'Failed to get account info'}), 500
+    if result.get('status') != 'success':
+        return jsonify({'error': result.get('message', 'Failed to authorize')}), 400
     
-    balance_success, balance, currency, loginid = DerivService.get_balance(api_token)
-    
-    if not balance_success:
-        balance = 0
-        currency = 'USD'
+    loginid = result.get('loginid')
+    balance = result.get('balance', 0)
     
     if loginid and loginid.startswith('VRTC'):
         acc_type = 'Demo'
@@ -563,14 +495,17 @@ def test_connect():
     else:
         acc_type = account_type
     
+    # Clean up test connection
+    test_ws.disconnect()
+    
     return jsonify({
         'message': 'Deriv account connected successfully',
         'account': {
-            'account_id': account_info['account_id'],
+            'account_id': loginid,
             'balance': balance,
-            'currency': currency,
+            'currency': 'USD',
             'account_type': acc_type,
-            'email': account_info['email'],
+            'email': '',
             'trading_account_id': loginid
         }
     }), 200
