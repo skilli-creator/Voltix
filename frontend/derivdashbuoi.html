@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Voltix Trader</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+    <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+    <div id="app">
+        <!-- TOP NAVIGATION -->
+        <header class="top-bar">
+            <div class="brand">
+                <i class="fas fa-bolt" style="color:#2962ff;"></i>
+                Voltix <span>Trader</span>
+            </div>
+            <div class="top-bar-actions">
+                <div class="account-item">
+                    <span class="label">Code:</span>
+                    <span class="value" id="accountCode">CR123456</span>
+                </div>
+                <div class="account-item">
+                    <span class="label">Balance:</span>
+                    <span class="value" id="accountBalance">$7,110.00</span>
+                </div>
+                <div class="account-badge" onclick="toggleDropdown(event)">
+                    <span class="badge-dot real" id="badgeDot"></span>
+                    <span id="accountTypeLabel">Real</span>
+                    <i class="fas fa-chevron-down chevron"></i>
+                    <div class="account-dropdown" id="accountDropdown">
+                        <div class="dropdown-item active" data-type="real" onclick="switchAccount('real')">
+                            <span class="dot real"></span> Real Account
+                        </div>
+                        <div class="dropdown-item" data-type="demo" onclick="switchAccount('demo')">
+                            <span class="dot demo"></span> Demo Account
+                        </div>
+                    </div>
+                </div>
+                <span class="divider"></span>
+                <a href="#" class="top-btn" id="withdrawBtn" target="_blank">
+                    <i class="fas fa-arrow-up-right-from-square"></i> Withdraw
+                </a>
+                <button class="top-btn danger" onclick="showLogoutModal()">
+                    <i class="fas fa-sign-out-alt"></i> Logout
+                </button>
+            </div>
+        </header>
+
+        <!-- MAIN BODY -->
+        <div class="main-body">
+
+            <!-- LEFT PANEL -->
+            <nav class="left-panel">
+                <div class="left-menu-item active" data-tab="open" onclick="switchTab('open')">
+                    <i class="fas fa-folder-open"></i> Open <span class="badge" id="openCount">0</span>
+                </div>
+                <div class="left-menu-item" data-tab="closed" onclick="switchTab('closed')">
+                    <i class="fas fa-check-circle"></i> Closed <span class="badge" id="closedCount">8</span>
+                </div>
+                <div class="left-menu-item" data-tab="transactions" onclick="switchTab('transactions')">
+                    <i class="fas fa-receipt"></i> Transactions
+                </div>
+                <div class="left-panel-section">
+                    <div class="section-label">Session P/L</div>
+                    <div class="session-pl negative" id="sessionPL">-$1,270.00</div>
+                </div>
+                <div class="left-panel-footer">
+                    <i class="fas fa-circle" style="color:#00b894;font-size:8px;margin-right:6px;"></i> 
+                    <span id="connectionStatus">Connected</span>
+                </div>
+            </nav>
+
+            <!-- CENTER PANEL -->
+            <main class="center-panel">
+
+                <!-- Center Header -->
+                <div class="center-header">
+                    <div>
+                        <h2 class="title">Volatility 10 (1s) Index</h2>
+                        <div class="price-display">
+                            <span class="price" id="currentPrice">9561.32</span>
+                            <span class="change negative" id="priceChange">-61.32 (0.65%)</span>
+                        </div>
+                    </div>
+                    <div class="center-actions">
+                        <button class="chip-btn active" onclick="setChartView('candlestick')">
+                            <i class="fas fa-candlestick-chart"></i> Candlestick
+                        </button>
+                        <button class="chip-btn" onclick="setChartView('line')">
+                            <i class="fas fa-chart-line"></i> Line
+                        </button>
+                        <button class="chip-btn" onclick="setChartView('depth')">
+                            <i class="fas fa-layer-group"></i> Depth
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Balance Card -->
+                <div class="balance-card">
+                    <div>
+                        <div class="balance-label">Available Balance</div>
+                        <div class="balance-amount">$<span id="mainBalance">7,110.00</span></div>
+                    </div>
+                    <div class="balance-actions">
+                        <button class="btn-primary" onclick="handleDeposit()">
+                            <i class="fas fa-plus-circle"></i> Deposit
+                        </button>
+                        <button class="btn-outline" onclick="handleHistory()">
+                            <i class="fas fa-clock-rotate-left"></i> History
+                        </button>
+                        <button class="btn-outline" onclick="handleChat()">
+                            <i class="fas fa-comment"></i> Chat
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Chart Area -->
+                <div class="chart-container">
+                    <div class="chart-toolbar">
+                        <div class="timeframes">
+                            <button class="tf-btn active">1m</button>
+                            <button class="tf-btn">5m</button>
+                            <button class="tf-btn">15m</button>
+                            <button class="tf-btn">1h</button>
+                            <button class="tf-btn">4h</button>
+                        </div>
+                        <div class="chart-indicators">
+                            <button class="ind-btn">MA</button>
+                            <button class="ind-btn">BB</button>
+                            <button class="ind-btn">RSI</button>
+                            <button class="ind-btn">MACD</button>
+                        </div>
+                    </div>
+                    <div class="chart-area" id="chartArea">
+                        <canvas id="chartCanvas"></canvas>
+                        <div class="chart-overlay" id="chartOverlay">
+                            <div class="tick-price" id="tickPrice">9561.32</div>
+                            <div class="tick-time" id="tickTime">1:08:30</div>
+                        </div>
+                    </div>
+                    <!-- Tick history -->
+                    <div class="tick-history" id="tickHistory">
+                        <div class="tick-row">
+                            <span>20:08:33</span>
+                            <span>9561.32</span>
+                            <span class="change">+0.12</span>
+                        </div>
+                        <div class="tick-row">
+                            <span>20:08:37</span>
+                            <span>9561.45</span>
+                            <span class="change">+0.13</span>
+                        </div>
+                        <div class="tick-row">
+                            <span>20:08:40</span>
+                            <span>9561.28</span>
+                            <span class="change negative">-0.17</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Active Trades -->
+                <div class="trades-section" id="tradesSection">
+                    <div class="section-header">
+                        <h3>Active Positions</h3>
+                        <span class="count" id="positionCount">0</span>
+                    </div>
+                    <div class="trades-list" id="tradesList">
+                        <div class="no-trades" id="noTrades">
+                            <i class="fas fa-inbox"></i>
+                            No open positions
+                            <span>Your active trades will appear here</span>
+                        </div>
+                    </div>
+                </div>
+
+            </main>
+
+            <!-- RIGHT PANEL -->
+            <aside class="right-panel">
+                <div class="panel-header">
+                    <h3>Trade Execution</h3>
+                    <a href="#" class="learn-link" onclick="showLearnMore()">
+                        <i class="fas fa-circle-info"></i> Learn
+                    </a>
+                </div>
+
+                <div class="trade-type-tabs">
+                    <button class="type-tab active" data-type="overunder" onclick="setTradeType('overunder')">
+                        Over/Under
+                    </button>
+                    <button class="type-tab" data-type="auto" onclick="setTradeType('auto')">
+                        <i class="fas fa-robot"></i> Auto
+                    </button>
+                    <button class="type-tab" data-type="manual" onclick="setTradeType('manual')">
+                        Manual
+                    </button>
+                </div>
+
+                <!-- Over/Under Controls -->
+                <div class="trade-controls" id="tradeControls">
+                    <div class="control-group">
+                        <label>Stake Amount</label>
+                        <div class="stake-input-group">
+                            <input type="number" class="stake-input" id="stakeInput" value="10.00" step="0.50" min="0.50" />
+                            <div class="stake-presets">
+                                <button class="preset-btn" onclick="setStake(5)">$5</button>
+                                <button class="preset-btn" onclick="setStake(10)">$10</button>
+                                <button class="preset-btn" onclick="setStake(25)">$25</button>
+                                <button class="preset-btn" onclick="setStake(50)">$50</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label>Duration</label>
+                        <div class="duration-selector">
+                            <button class="dur-btn active" data-duration="60" onclick="setDuration(60)">1m</button>
+                            <button class="dur-btn" data-duration="120" onclick="setDuration(120)">2m</button>
+                            <button class="dur-btn" data-duration="300" onclick="setDuration(300)">5m</button>
+                            <button class="dur-btn" data-duration="600" onclick="setDuration(600)">10m</button>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label>Direction</label>
+                        <div class="direction-buttons">
+                            <button class="dir-btn over active" onclick="setDirection('over')">
+                                <i class="fas fa-arrow-up"></i> Over
+                            </button>
+                            <button class="dir-btn under" onclick="setDirection('under')">
+                                <i class="fas fa-arrow-down"></i> Under
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="control-group">
+                        <label>Payout Preview</label>
+                        <div class="payout-preview">
+                            <div class="payout-row">
+                                <span>Potential Payout</span>
+                                <span class="payout-amount" id="payoutAmount">$13.57</span>
+                            </div>
+                            <div class="payout-row">
+                                <span>Profit</span>
+                                <span class="profit-amount" id="profitAmount">$3.57</span>
+                            </div>
+                            <div class="payout-row">
+                                <span>Win Probability</span>
+                                <span class="probability" id="winProbability">35.71%</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Auto Trading Controls -->
+                    <div class="auto-controls" id="autoControls" style="display:none;">
+                        <div class="control-group">
+                            <label>Strategy</label>
+                            <select class="strategy-select" id="strategySelect">
+                                <option value="manual">Manual</option>
+                                <option value="martingale">Martingale</option>
+                                <option value="anti_loss">Anti-Loss</option>
+                                <option value="scalping">Scalping</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Max Daily Loss</label>
+                            <input type="number" class="stake-input" id="maxDailyLoss" value="1000" step="100" />
+                        </div>
+                        <div class="control-group">
+                            <label>Auto-Trade</label>
+                            <div class="auto-toggle">
+                                <button class="toggle-btn" id="autoToggle" onclick="toggleAutoTrade()">
+                                    <i class="fas fa-play"></i> Start Auto
+                                </button>
+                                <span class="auto-status" id="autoStatus">Stopped</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button class="place-trade-btn" id="placeTradeBtn" onclick="placeTrade()">
+                        <i class="fas fa-arrow-right"></i> Place Trade
+                    </button>
+                </div>
+
+                <div class="trade-footer">
+                    <span><span id="openPositionsCount">0</span> open positions</span>
+                    <span class="time" id="tradeTime">1:08:30</span>
+                </div>
+            </aside>
+
+        </div>
+    </div>
+
+    <!-- LOGOUT MODAL -->
+    <div class="modal-overlay" id="logoutModal">
+        <div class="modal-box">
+            <h3><i class="fas fa-sign-out-alt" style="color:#ff4757;"></i> Confirm Logout</h3>
+            <p>Are you sure you want to log out of Voltix Trader?</p>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeLogoutModal()">Cancel</button>
+                <button class="btn-confirm" onclick="confirmLogout()">Logout</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- CONNECTION STATUS -->
+    <div class="connection-status" id="connectionStatusBadge">
+        <i class="fas fa-circle" style="color:#00b894;"></i> Live
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.0/socket.io.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>

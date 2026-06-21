@@ -40,8 +40,8 @@ def signup():
     if not validate_phone(phone):
         return jsonify({'error': 'Invalid phone number'}), 400
     
-    if len(password) < 6:
-        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    if len(password) < 8:
+        return jsonify({'error': 'Password must be at least 8 characters'}), 400
     
     if db.get_user_by_email(email):
         return jsonify({'error': 'Email already registered'}), 400
